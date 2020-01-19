@@ -29,7 +29,6 @@
 #include <linux/slab.h>
 #include <linux/acpi.h>
 #include <linux/of.h>
-#include <linux/pm_wakeirq.h>
 #include <asm/unaligned.h>
 
 struct goodix_ts_data {
@@ -287,15 +286,17 @@ static void goodix_process_events(struct goodix_ts_data *ts)
 	int touch_num;
 	int i;
 
-	/*if (goodix_generate_wake_up_trigger) {
+	if (goodix_generate_wake_up_trigger) {
 		printk("###### Input trigger activated %d\n", __LINE__);
 		goodix_generate_wake_up_trigger = 0;
+
+		input_set_capability(ts->input_dev, EV_KEY, KEY_POWER);
 
 		input_report_key(ts->input_dev, KEY_POWER, 1);
 		input_sync(ts->input_dev);
 		input_report_key(ts->input_dev, KEY_POWER, 0);
 		input_sync(ts->input_dev);
-	}*/
+	}
 
 	touch_num = goodix_ts_read_input_report(ts, point_data);
 	if (touch_num < 0)
@@ -766,7 +767,6 @@ err_release_cfg:
 static int goodix_ts_probe(struct i2c_client *client,
 			   const struct i2c_device_id *id)
 {
-	struct device *dev;
 	struct goodix_ts_data *ts;
 	int error;
 
@@ -847,10 +847,6 @@ static int goodix_ts_probe(struct i2c_client *client,
 			return error;
 	}
 
-	dev = &ts->client->dev;
-	device_init_wakeup(dev, true);
-	device_set_wakeup_capable(dev, true);
-
 	return 0;
 
 err_sysfs_remove_group:
@@ -873,27 +869,85 @@ static int goodix_ts_remove(struct i2c_client *client)
 	return 0;
 }
 
-static int goodix_suspend(struct device *device)
+static int __maybe_unused goodix_suspend(struct device *dev)
 {
-struct i2c_client *client = to_i2c_client(device);
+	struct i2c_client *client = to_i2c_client(dev);
+	struct goodix_ts_data *ts = i2c_get_clientdata(client);
+	int error;
 
-if (device_may_wakeup(&client->dev))
-enable_irq_wake(client->irq);
-return 0;
+	printk("####### %s %d\n", __func__, __LINE__);
+
+	/* We need gpio pins to suspend/resume */
+	if (!ts->gpiod_int || !ts->gpiod_rst) {
+		disable_irq(client->irq);
+		return 0;
+	}
+
+	wait_for_completion(&ts->firmware_loading_complete);
+
+	/* Free IRQ as IRQ pin is used as output in the suspend sequence */
+	goodix_free_irq(ts);
+
+	/* Output LOW on the INT pin for 5 ms */
+	error = gpiod_direction_output(ts->gpiod_int, 0);
+	if (error) {
+		goodix_request_irq(ts);
+		return error;
+	}
+
+	usleep_range(5000, 6000);
+
+	error = goodix_i2c_write_u8(ts->client, GOODIX_REG_COMMAND,
+				    GOODIX_CMD_SCREEN_OFF);
+	if (error) {
+		dev_err(&ts->client->dev, "Screen off command failed\n");
+		gpiod_direction_input(ts->gpiod_int);
+		goodix_request_irq(ts);
+		return -EAGAIN;
+	}
+
+	/*
+	 * The datasheet specifies that the interval between sending screen-off
+	 * command and wake-up should be longer than 58 ms. To avoid waking up
+	 * sooner, delay 58ms here.
+	 */
+	msleep(58);
+	return 0;
 }
 
-static int goodix_resume(struct device *device)
+static int __maybe_unused goodix_resume(struct device *dev)
 {
-struct i2c_client *client = to_i2c_client(device);
+	struct i2c_client *client = to_i2c_client(dev);
+	struct goodix_ts_data *ts = i2c_get_clientdata(client);
+	int error;
 
-if (device_may_wakeup(&client->dev))
-disable_irq_wake(client->irq);
-return 0;
+	if (!ts->gpiod_int || !ts->gpiod_rst) {
+		enable_irq(client->irq);
+		return 0;
+	}
+
+	/*
+	 * Exit sleep mode by outputting HIGH level to INT pin
+	 * for 2ms~5ms.
+	 */
+	error = gpiod_direction_output(ts->gpiod_int, 1);
+	if (error)
+		return error;
+
+	usleep_range(2000, 5000);
+
+	error = goodix_int_sync(ts);
+	if (error)
+		return error;
+
+	error = goodix_request_irq(ts);
+	if (error)
+		return error;
+
+	return 0;
 }
 
-static const struct dev_pm_ops goodix_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(goodix_suspend, goodix_resume)
-};
+static SIMPLE_DEV_PM_OPS(goodix_pm_ops, goodix_suspend, goodix_resume);
 
 static const struct i2c_device_id goodix_ts_id[] = {
 	{ "GDIX1001:00", 0 },
