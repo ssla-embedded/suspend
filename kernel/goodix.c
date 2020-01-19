@@ -15,6 +15,7 @@
  * Software Foundation; version 2 of the License.
  */
 
+#include <drm/drmP.h>
 #include <linux/kernel.h>
 #include <linux/dmi.h>
 #include <linux/firmware.h>
@@ -29,11 +30,14 @@
 #include <linux/slab.h>
 #include <linux/acpi.h>
 #include <linux/of.h>
+#include <linux/pm_runtime.h>
 #include <asm/unaligned.h>
 
 struct goodix_ts_data {
 	struct i2c_client *client;
 	struct input_dev *input_dev;
+	struct device_node *disp_node;
+	struct notifier_block drmnb;
 	int abs_x_max;
 	int abs_y_max;
 	bool swapped_x_y;
@@ -42,6 +46,7 @@ struct goodix_ts_data {
 	unsigned int max_touch_num;
 	unsigned int int_trigger_type;
 	int cfg_len;
+	int substitute_i2c_address;
 	struct gpio_desc *gpiod_int;
 	struct gpio_desc *gpiod_rst;
 	u16 id;
@@ -49,10 +54,20 @@ struct goodix_ts_data {
 	const char *cfg_name;
 	struct completion firmware_loading_complete;
 	unsigned long irq_flags;
+	atomic_t esd_timeout;
+	struct delayed_work esd_work;
+	bool suspended;
+	atomic_t open_count;
+	/* Protects power management calls and access to suspended flag */
+	struct mutex mutex;
+	struct mutex irq_enable_mutex;
+	int irq_active;
+	int drm_disabled_irq;
 };
 
 #define GOODIX_GPIO_INT_NAME		"irq"
 #define GOODIX_GPIO_RST_NAME		"reset"
+#define GOODIX_DEVICE_ESD_TIMEOUT_PROPERTY     "esd-recovery-timeout-ms"
 
 #define GOODIX_MAX_HEIGHT		4096
 #define GOODIX_MAX_WIDTH		4096
@@ -67,6 +82,8 @@ struct goodix_ts_data {
 /* Register defines */
 #define GOODIX_REG_COMMAND		0x8040
 #define GOODIX_CMD_SCREEN_OFF		0x05
+#define GOODIX_CMD_ESD_ENABLED		0xAA
+#define GOODIX_REG_ESD_CHECK		0x8041
 
 #define GOODIX_READ_COOR_ADDR		0x814E
 #define GOODIX_REG_CONFIG_DATA		0x8047
@@ -78,6 +95,8 @@ struct goodix_ts_data {
 #define RESOLUTION_LOC		1
 #define MAX_CONTACTS_LOC	5
 #define TRIGGER_LOC		6
+
+#define GOODIX_AUTOSUSPEND_DELAY_MS	2000
 
 static const unsigned long goodix_irq_flags[] = {
 	IRQ_TYPE_EDGE_RISING,
@@ -183,6 +202,7 @@ static int goodix_get_cfg_len(u16 id)
 	case 911:
 	case 9271:
 	case 9110:
+	case 9157:
 	case 927:
 	case 928:
 		return GOODIX_CONFIG_911_LENGTH;
@@ -194,6 +214,29 @@ static int goodix_get_cfg_len(u16 id)
 	default:
 		return GOODIX_CONFIG_MAX_LENGTH;
 	}
+}
+
+static int goodix_set_power_state(struct goodix_ts_data *ts, bool on)
+{
+	int error;
+
+	if (on) {
+		error = pm_runtime_get_sync(&ts->client->dev);
+	} else {
+		pm_runtime_mark_last_busy(&ts->client->dev);
+		error = pm_runtime_put_autosuspend(&ts->client->dev);
+	}
+
+	if (error < 0) {
+		dev_err(&ts->client->dev,
+			"failed to change power state to %d\n", on);
+		if (on)
+			pm_runtime_put_noidle(&ts->client->dev);
+
+		return error;
+	}
+
+	return 0;
 }
 
 static int goodix_ts_read_input_report(struct goodix_ts_data *ts, u8 *data)
@@ -236,15 +279,16 @@ static int goodix_ts_read_input_report(struct goodix_ts_data *ts, u8 *data)
 
 			return touch_num;
 		}
-
+		if (time_after(jiffies, max_timeout))
+			break;
 		usleep_range(1000, 2000); /* Poll every 1 - 2 ms */
-	} while (time_before(jiffies, max_timeout));
+	} while (1);
 
 	/*
 	 * The Goodix panel will send spurious interrupts after a
 	 * 'finger up' event, which will always cause a timeout.
 	 */
-	return 0;
+	return -EAGAIN;
 }
 
 static void goodix_ts_report_touch(struct goodix_ts_data *ts, u8 *coor_data)
@@ -334,16 +378,25 @@ static irqreturn_t goodix_ts_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static void goodix_free_irq(struct goodix_ts_data *ts)
+static void goodix_disable_irq(struct goodix_ts_data *ts)
 {
-	devm_free_irq(&ts->client->dev, ts->client->irq, ts);
+	mutex_lock(&ts->irq_enable_mutex);
+	if (ts->irq_active) {
+		ts->irq_active = 0;
+		disable_irq(ts->client->irq);
+	}
+	mutex_unlock(&ts->irq_enable_mutex);
 }
 
-static int goodix_request_irq(struct goodix_ts_data *ts)
+static int goodix_enable_irq(struct goodix_ts_data *ts)
 {
-	return devm_request_threaded_irq(&ts->client->dev, ts->client->irq,
-					 NULL, goodix_ts_irq_handler,
-					 ts->irq_flags, ts->client->name, ts);
+	mutex_lock(&ts->irq_enable_mutex);
+	if (!ts->irq_active) {
+		enable_irq(ts->client->irq);
+		ts->irq_active = 1;
+	}
+	mutex_unlock(&ts->irq_enable_mutex);
+	return 0;
 }
 
 /**
@@ -413,21 +466,91 @@ static int goodix_send_cfg(struct goodix_ts_data *ts,
 	return 0;
 }
 
+static int set_reset_output_val(struct goodix_ts_data *ts, int val)
+{
+	int ret;
+
+	ret = gpiod_direction_output(ts->gpiod_rst, val);
+#if 0
+	if (ts->substitute_i2c_address) {
+		struct i2c_msg msg;
+		unsigned char buf[4];
+
+		/* reg = <0x1f>, 9 - output high, 1 - output low*/
+		buf[0] = 0x1f;
+		buf[1] = val ? 9 : 1;
+
+		msg.flags = 0;
+		msg.addr = ts->substitute_i2c_address;
+		msg.buf = buf;
+		msg.len = 2;
+
+		ret = i2c_transfer(ts->client->adapter, &msg, 1);
+		return ret < 0 ? ret : (ret != 1 ? -EIO : 0);
+	}
+#endif
+	return ret;
+}
+
+/* reg = <0x1d>, 3 - input, 9 - output high, 1 - output low*/
+
+static int set_int_output_val(struct goodix_ts_data *ts, int val)
+{
+	int ret;
+
+	if (ts->substitute_i2c_address) {
+		struct i2c_msg msg;
+		unsigned char buf[4];
+
+		buf[0] = 0x1d;
+		buf[1] = val ? 9 : 1;
+
+		msg.flags = 0;
+		msg.addr = ts->substitute_i2c_address;
+		msg.buf = buf;
+		msg.len = 2;
+
+		ret = i2c_transfer(ts->client->adapter, &msg, 1);
+		return ret < 0 ? ret : (ret != 1 ? -EIO : 0);
+	}
+	ret = gpiod_direction_output(ts->gpiod_int, val);
+	return ret;
+}
+
+static int set_int_input(struct goodix_ts_data *ts)
+{
+	int ret;
+
+	ret = gpiod_direction_input(ts->gpiod_int);
+	if (ts->substitute_i2c_address) {
+		struct i2c_msg msg;
+		unsigned char buf[4];
+
+		buf[0] = 0x1d;
+		buf[1] = 3;
+
+		msg.flags = 0;
+		msg.addr = ts->substitute_i2c_address;
+		msg.buf = buf;
+		msg.len = 2;
+
+		ret = i2c_transfer(ts->client->adapter, &msg, 1);
+		return ret < 0 ? ret : (ret != 1 ? -EIO : 0);
+	}
+	return ret;
+}
+
 static int goodix_int_sync(struct goodix_ts_data *ts)
 {
 	int error;
 
-	error = gpiod_direction_output(ts->gpiod_int, 0);
+	error = set_int_output_val(ts, 0);
 	if (error)
 		return error;
 
 	msleep(50);				/* T5: 50ms */
 
-	error = gpiod_direction_input(ts->gpiod_int);
-	if (error)
-		return error;
-
-	return 0;
+	return set_int_input(ts);
 }
 
 /**
@@ -440,29 +563,24 @@ static int goodix_reset(struct goodix_ts_data *ts)
 	int error;
 
 	/* begin select I2C slave addr */
-	error = gpiod_direction_output(ts->gpiod_rst, 0);
+	error = set_reset_output_val(ts, 0);
 	if (error)
 		return error;
 
 	msleep(20);				/* T2: > 10ms */
 
 	/* HIGH: 0x28/0x29, LOW: 0xBA/0xBB */
-	error = gpiod_direction_output(ts->gpiod_int, ts->client->addr == 0x14);
+	error = set_int_output_val(ts, ts->client->addr == 0x14);
 	if (error)
 		return error;
 
 	usleep_range(100, 2000);		/* T3: > 100us */
 
-	error = gpiod_direction_output(ts->gpiod_rst, 1);
+	error = set_reset_output_val(ts, 1);
 	if (error)
 		return error;
 
 	usleep_range(6000, 10000);		/* T4: > 5ms */
-
-	/* end select I2C slave addr */
-	error = gpiod_direction_input(ts->gpiod_rst);
-	if (error)
-		return error;
 
 	error = goodix_int_sync(ts);
 	if (error)
@@ -480,6 +598,10 @@ static ssize_t goodix_dump_config_show(struct device *dev,
 
 	wait_for_completion(&ts->firmware_loading_complete);
 
+	error = goodix_set_power_state(ts, true);
+	if (error)
+		return error;
+
 	error = goodix_i2c_read(ts->client, GOODIX_REG_CONFIG_DATA,
 				config, ts->cfg_len);
 	if (error) {
@@ -488,22 +610,158 @@ static ssize_t goodix_dump_config_show(struct device *dev,
 		return error;
 	}
 
+	goodix_set_power_state(ts, false);
+
 	for (i = 0; i < ts->cfg_len; i++)
 		count += scnprintf(buf + count, PAGE_SIZE - count, "%02x ",
 				   config[i]);
 	return count;
 }
 
+static void goodix_disable_esd(struct goodix_ts_data *ts)
+{
+	if (!atomic_read(&ts->esd_timeout))
+		return;
+	cancel_delayed_work_sync(&ts->esd_work);
+}
+
+static int goodix_enable_esd(struct goodix_ts_data *ts)
+{
+	int error, esd_timeout;
+
+	esd_timeout = atomic_read(&ts->esd_timeout);
+	if (!esd_timeout)
+		return 0;
+
+	error = goodix_i2c_write_u8(ts->client, GOODIX_REG_ESD_CHECK,
+				    GOODIX_CMD_ESD_ENABLED);
+	if (error) {
+		dev_err(&ts->client->dev, "Failed to enable ESD: %d\n", error);
+		return error;
+	}
+
+	schedule_delayed_work(&ts->esd_work, round_jiffies_relative(
+			      msecs_to_jiffies(esd_timeout)));
+	return 0;
+}
+
+static void goodix_esd_work(struct work_struct *work)
+{
+	struct goodix_ts_data *ts = container_of(work, struct goodix_ts_data,
+						 esd_work.work);
+	int retries = 3, error;
+	u8 esd_data[2];
+	const struct firmware *cfg = NULL;
+
+	wait_for_completion(&ts->firmware_loading_complete);
+
+	while (--retries) {
+		error = goodix_i2c_read(ts->client, GOODIX_REG_COMMAND,
+					esd_data, sizeof(esd_data));
+		if (error)
+			continue;
+		if (esd_data[0] != GOODIX_CMD_ESD_ENABLED &&
+		    esd_data[1] == GOODIX_CMD_ESD_ENABLED) {
+			/* feed the watchdog */
+			goodix_i2c_write_u8(ts->client,
+					    GOODIX_REG_COMMAND,
+					    GOODIX_CMD_ESD_ENABLED);
+			break;
+		}
+	}
+
+	if (!retries) {
+		dev_dbg(&ts->client->dev, "Performing ESD recovery.\n");
+		goodix_disable_irq(ts);
+		goodix_reset(ts);
+		error = request_firmware(&cfg, ts->cfg_name, &ts->client->dev);
+		if (!error) {
+			goodix_send_cfg(ts, cfg);
+			release_firmware(cfg);
+		}
+		goodix_enable_irq(ts);
+		goodix_enable_esd(ts);
+		return;
+	}
+
+	schedule_delayed_work(&ts->esd_work, round_jiffies_relative(
+			      msecs_to_jiffies(atomic_read(&ts->esd_timeout))));
+}
+
+static ssize_t goodix_esd_timeout_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct goodix_ts_data *ts = dev_get_drvdata(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&ts->esd_timeout));
+}
+
+static ssize_t goodix_esd_timeout_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct goodix_ts_data *ts = dev_get_drvdata(dev);
+	int error, esd_timeout, new_esd_timeout;
+
+	error = kstrtouint(buf, 10, &new_esd_timeout);
+	if (error)
+		return error;
+
+	esd_timeout = atomic_read(&ts->esd_timeout);
+	if (esd_timeout && !new_esd_timeout &&
+	    pm_runtime_active(&ts->client->dev))
+		goodix_disable_esd(ts);
+
+	atomic_set(&ts->esd_timeout, new_esd_timeout);
+	if (!esd_timeout && new_esd_timeout &&
+	    pm_runtime_active(&ts->client->dev))
+		goodix_enable_esd(ts);
+
+	return count;
+}
+
 static DEVICE_ATTR(dump_config, S_IRUGO, goodix_dump_config_show, NULL);
+/* ESD timeout in ms. Default disabled (0). Recommended 2000 ms. */
+static DEVICE_ATTR(esd_timeout, S_IRUGO | S_IWUSR, goodix_esd_timeout_show,
+		   goodix_esd_timeout_store);
 
 static struct attribute *goodix_attrs[] = {
 	&dev_attr_dump_config.attr,
+	&dev_attr_esd_timeout.attr,
 	NULL
 };
 
 static const struct attribute_group goodix_attr_group = {
 	.attrs = goodix_attrs,
 };
+
+static int goodix_open(struct input_dev *input_dev)
+{
+	struct goodix_ts_data *ts = input_get_drvdata(input_dev);
+	int error;
+
+	if (!ts->gpiod_int || !ts->gpiod_rst)
+		return 0;
+
+	wait_for_completion(&ts->firmware_loading_complete);
+
+	error = goodix_set_power_state(ts, true);
+	if (error)
+		return error;
+	atomic_inc(&ts->open_count);
+	return 0;
+}
+
+static void goodix_close(struct input_dev *input_dev)
+{
+	struct goodix_ts_data *ts = input_get_drvdata(input_dev);
+
+	if (!ts->gpiod_int || !ts->gpiod_rst)
+		return;
+
+	goodix_set_power_state(ts, false);
+	atomic_dec(&ts->open_count);
+}
 
 /**
  * goodix_get_gpio_config - Get GPIO config from ACPI/DT
@@ -544,6 +802,19 @@ static int goodix_get_gpio_config(struct goodix_ts_data *ts)
 
 	ts->gpiod_rst = gpiod;
 
+	error = of_property_read_u32_index(dev->of_node,
+			"substitute-i2c-address",
+				0, &ts->substitute_i2c_address);
+	if (ts->substitute_i2c_address) {
+		if (set_int_input(ts)) {
+			ts->substitute_i2c_address = 0;
+			dev_info(dev, "disabling substitute_i2c_address\n");
+		} else {
+			dev_info(dev, "substitute_i2c_address=0x%x\n",
+					ts->substitute_i2c_address);
+
+		}
+	}
 	return 0;
 }
 
@@ -686,6 +957,9 @@ static int goodix_request_input_dev(struct goodix_ts_data *ts)
 	ts->input_dev->id.vendor = 0x0416;
 	ts->input_dev->id.product = ts->id;
 	ts->input_dev->id.version = ts->version;
+	ts->input_dev->open = goodix_open;
+	ts->input_dev->close = goodix_close;
+	input_set_drvdata(ts->input_dev, ts);
 
 	/* Capacitive Windows/Home button on some devices */
 	input_set_capability(ts->input_dev, EV_KEY, KEY_LEFTMETA);
@@ -712,8 +986,6 @@ static int goodix_request_input_dev(struct goodix_ts_data *ts)
  */
 static int goodix_configure_dev(struct goodix_ts_data *ts)
 {
-	int error;
-
 	ts->swapped_x_y = device_property_read_bool(&ts->client->dev,
 						    "touchscreen-swapped-x-y");
 	ts->inverted_x = device_property_read_bool(&ts->client->dev,
@@ -722,15 +994,77 @@ static int goodix_configure_dev(struct goodix_ts_data *ts)
 						   "touchscreen-inverted-y");
 
 	goodix_read_config(ts);
+	return 0;
+}
+
+static int ts_drm_event(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct drm_device *drm_dev = data;
+	struct device_node *node = drm_dev->dev->of_node;
+	struct goodix_ts_data *ts = container_of(nb, struct goodix_ts_data, drmnb);
+	struct device *dev = &ts->client->dev;
+
+	dev_dbg(dev, "%s: event %lx\n", __func__, event);
+
+	if (node != ts->disp_node) {
+		dev_info(dev, "%s: event %lx, (%s)%p (%s)%p\n", __func__, event, node->name, node, ts->disp_node->name, ts->disp_node);
+		return 0;
+	}
+
+	switch (event) {
+	case DRM_MODE_DPMS_ON:
+		dev_dbg(dev, "%s: ON %lx\n", __func__, event);
+		if (ts->drm_disabled_irq) {
+			ts->drm_disabled_irq = 0;
+			goodix_enable_irq(ts);
+		}
+		break;
+	case DRM_MODE_DPMS_STANDBY:
+		break;
+	case DRM_MODE_DPMS_SUSPEND:
+	case DRM_MODE_DPMS_OFF:
+		dev_dbg(dev, "%s: OFF %lx\n", __func__, event);
+		if (!ts->drm_disabled_irq) {
+			ts->drm_disabled_irq = 1;
+			goodix_disable_irq(ts);
+		}
+		break;
+	default:
+		dev_info(dev, "%s: unknown event %lx\n", __func__, event);
+	}
+
+	return 0;
+}
+
+static int goodix_finish_setup(struct goodix_ts_data *ts)
+{
+	int error;
+        struct device_node *np = ts->client->dev.of_node;
 
 	error = goodix_request_input_dev(ts);
 	if (error)
 		return error;
 
 	ts->irq_flags = goodix_irq_flags[ts->int_trigger_type] | IRQF_ONESHOT;
-	error = goodix_request_irq(ts);
+	irq_set_status_flags(ts->client->irq, IRQ_NOAUTOEN);
+	error = devm_request_threaded_irq(&ts->client->dev, ts->client->irq,
+					 NULL, goodix_ts_irq_handler,
+					 ts->irq_flags, ts->client->name, ts);
+	if (error < 0) {
+		dev_err(&ts->client->dev, "request_threaded_irq failed(%d)\n", error);
+		return error;
+	}
+	ts->disp_node = of_parse_phandle(np, "display", 0);
+	if (ts->disp_node) {
+		ts->drmnb.notifier_call = ts_drm_event;
+		error = drm_register_client(&ts->drmnb);
+		if (error < 0)
+			dev_err(&ts->client->dev, "drm_register_client failed(%d)\n", error);
+	}
+
+	error = goodix_enable_irq(ts);
 	if (error) {
-		dev_err(&ts->client->dev, "request IRQ failed: %d\n", error);
+		dev_err(&ts->client->dev, "enable IRQ failed: %d\n", error);
 		return error;
 	}
 
@@ -743,7 +1077,8 @@ static int goodix_configure_dev(struct goodix_ts_data *ts)
  * @ts: our goodix_ts_data pointer
  *
  * request_firmware_wait callback that finishes
- * initialization of the device.
+ * initialization of the device. This will only be called
+ * when ts->gpiod_int and ts->gpiod_rst are properly initialized.
  */
 static void goodix_config_cb(const struct firmware *cfg, void *ctx)
 {
@@ -757,7 +1092,29 @@ static void goodix_config_cb(const struct firmware *cfg, void *ctx)
 			goto err_release_cfg;
 	}
 
-	goodix_configure_dev(ts);
+	error = goodix_configure_dev(ts);
+	if (error)
+		goto err_release_cfg;
+
+	goodix_enable_esd(ts);
+
+	pm_runtime_set_autosuspend_delay(&ts->client->dev,
+					 GOODIX_AUTOSUSPEND_DELAY_MS);
+	pm_runtime_use_autosuspend(&ts->client->dev);
+	error = pm_runtime_set_active(&ts->client->dev);
+	if (error) {
+		dev_err(&ts->client->dev, "failed to set active: %d\n", error);
+		goto err_release_cfg;
+	}
+	pm_runtime_enable(&ts->client->dev);
+	/* Must not suspend immediately after device initialization */
+	pm_runtime_mark_last_busy(&ts->client->dev);
+	pm_request_autosuspend(&ts->client->dev);
+
+	release_firmware(cfg);
+	complete_all(&ts->firmware_loading_complete);
+	goodix_finish_setup(ts);
+	return;
 
 err_release_cfg:
 	release_firmware(cfg);
@@ -768,7 +1125,7 @@ static int goodix_ts_probe(struct i2c_client *client,
 			   const struct i2c_device_id *id)
 {
 	struct goodix_ts_data *ts;
-	int error;
+	int error, esd_timeout;
 
 	dev_dbg(&client->dev, "I2C Address: 0x%02x\n", client->addr);
 
@@ -784,6 +1141,9 @@ static int goodix_ts_probe(struct i2c_client *client,
 	ts->client = client;
 	i2c_set_clientdata(client, ts);
 	init_completion(&ts->firmware_loading_complete);
+	INIT_DELAYED_WORK(&ts->esd_work, goodix_esd_work);
+	mutex_init(&ts->mutex);
+	mutex_init(&ts->irq_enable_mutex);
 
 	error = goodix_get_gpio_config(ts);
 	if (error)
@@ -813,6 +1173,12 @@ static int goodix_ts_probe(struct i2c_client *client,
 	ts->cfg_len = goodix_get_cfg_len(ts->id);
 
 	if (ts->gpiod_int && ts->gpiod_rst) {
+		error = device_property_read_u32(&ts->client->dev,
+					GOODIX_DEVICE_ESD_TIMEOUT_PROPERTY,
+					&esd_timeout);
+		if (!error)
+			atomic_set(&ts->esd_timeout, esd_timeout);
+
 		error = sysfs_create_group(&client->dev.kobj,
 					   &goodix_attr_group);
 		if (error) {
@@ -839,14 +1205,14 @@ static int goodix_ts_probe(struct i2c_client *client,
 				error);
 			goto err_sysfs_remove_group;
 		}
-
-		return 0;
 	} else {
 		error = goodix_configure_dev(ts);
 		if (error)
 			return error;
+		error = goodix_finish_setup(ts);
+		if (error)
+			return error;
 	}
-
 	return 0;
 
 err_sysfs_remove_group:
@@ -859,23 +1225,28 @@ static int goodix_ts_remove(struct i2c_client *client)
 {
 	struct goodix_ts_data *ts = i2c_get_clientdata(client);
 
+	goodix_disable_irq(ts);
 	if (!ts->gpiod_int || !ts->gpiod_rst)
 		return 0;
 
+	drm_unregister_client(&ts->drmnb);
 	wait_for_completion(&ts->firmware_loading_complete);
 
+	pm_runtime_disable(&client->dev);
+	pm_runtime_set_suspended(&client->dev);
+	pm_runtime_put_noidle(&client->dev);
+
 	sysfs_remove_group(&client->dev.kobj, &goodix_attr_group);
+	goodix_disable_esd(ts);
 
 	return 0;
 }
 
-static int __maybe_unused goodix_suspend(struct device *dev)
+static int __maybe_unused goodix_sleep(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct goodix_ts_data *ts = i2c_get_clientdata(client);
-	int error;
-
-	printk("####### %s %d\n", __func__, __LINE__);
+	int error = 0;
 
 	/* We need gpio pins to suspend/resume */
 	if (!ts->gpiod_int || !ts->gpiod_rst) {
@@ -885,14 +1256,21 @@ static int __maybe_unused goodix_suspend(struct device *dev)
 
 	wait_for_completion(&ts->firmware_loading_complete);
 
-	/* Free IRQ as IRQ pin is used as output in the suspend sequence */
-	goodix_free_irq(ts);
+	mutex_lock(&ts->mutex);
+
+	if (ts->suspended)
+		goto out_error;
+
+	goodix_disable_esd(ts);
+
+	/* disable IRQ as IRQ pin is used as output in the suspend sequence */
+	goodix_disable_irq(ts);
 
 	/* Output LOW on the INT pin for 5 ms */
-	error = gpiod_direction_output(ts->gpiod_int, 0);
+	error = set_int_output_val(ts, 0);
 	if (error) {
-		goodix_request_irq(ts);
-		return error;
+		goodix_enable_irq(ts);
+		goto out_error;
 	}
 
 	usleep_range(5000, 6000);
@@ -901,9 +1279,10 @@ static int __maybe_unused goodix_suspend(struct device *dev)
 				    GOODIX_CMD_SCREEN_OFF);
 	if (error) {
 		dev_err(&ts->client->dev, "Screen off command failed\n");
-		gpiod_direction_input(ts->gpiod_int);
-		goodix_request_irq(ts);
-		return -EAGAIN;
+		set_int_input(ts);
+		goodix_enable_irq(ts);
+		error = -EAGAIN;
+		goto out_error;
 	}
 
 	/*
@@ -912,42 +1291,79 @@ static int __maybe_unused goodix_suspend(struct device *dev)
 	 * sooner, delay 58ms here.
 	 */
 	msleep(58);
+	ts->suspended = true;
+	mutex_unlock(&ts->mutex);
+
 	return 0;
+
+out_error:
+	mutex_unlock(&ts->mutex);
+	return error;
 }
 
-static int __maybe_unused goodix_resume(struct device *dev)
+static int __maybe_unused goodix_wakeup(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct goodix_ts_data *ts = i2c_get_clientdata(client);
-	int error;
+	int error = 0;
 
 	if (!ts->gpiod_int || !ts->gpiod_rst) {
 		enable_irq(client->irq);
 		return 0;
 	}
 
+	mutex_lock(&ts->mutex);
+
+	if (!ts->suspended)
+		goto out_error;
+
 	/*
 	 * Exit sleep mode by outputting HIGH level to INT pin
 	 * for 2ms~5ms.
 	 */
-	error = gpiod_direction_output(ts->gpiod_int, 1);
+	error = set_int_output_val(ts, 1);
 	if (error)
-		return error;
+		goto out_error;
 
 	usleep_range(2000, 5000);
 
 	error = goodix_int_sync(ts);
 	if (error)
-		return error;
+		goto out_error;
 
-	error = goodix_request_irq(ts);
+	error = goodix_enable_irq(ts);
 	if (error)
-		return error;
+		goto out_error;
+
+	error = goodix_enable_esd(ts);
+	if (error)
+		goto out_error;
+
+	ts->suspended = false;
+	mutex_unlock(&ts->mutex);
 
 	return 0;
+
+out_error:
+	mutex_unlock(&ts->mutex);
+	return error;
 }
 
-static SIMPLE_DEV_PM_OPS(goodix_pm_ops, goodix_suspend, goodix_resume);
+static int __maybe_unused goodix_resume(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct goodix_ts_data *ts = i2c_get_clientdata(client);
+
+	if (!atomic_read(&ts->open_count))
+		return 0;
+
+	return goodix_wakeup(dev);
+}
+
+static const struct dev_pm_ops goodix_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(goodix_sleep, goodix_resume)
+	SET_RUNTIME_PM_OPS(goodix_sleep, goodix_wakeup, NULL)
+};
 
 static const struct i2c_device_id goodix_ts_id[] = {
 	{ "GDIX1001:00", 0 },
