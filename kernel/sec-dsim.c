@@ -1668,11 +1668,11 @@ static void sec_mipi_dsim_bridge_disable(struct drm_bridge *bridge)
 	struct sec_mipi_dsim *dsim = bridge->driver_private;
 
 	/* disable panel if exists */
-	/*if (dsim->panel) {
+	if (dsim->panel) {
 		ret = drm_panel_disable(dsim->panel);
 		if (unlikely(ret))
 			dev_err(dsim->dev, "panel disable failed: %d\n", ret);
-	}*/
+	}
 
 	/* disable data transfer of dsim */
 	sec_mipi_dsim_set_standby(dsim, false);
