@@ -29,6 +29,7 @@
 #include <linux/slab.h>
 #include <linux/acpi.h>
 #include <linux/of.h>
+#include <linux/pm_wakeirq.h>
 #include <asm/unaligned.h>
 
 struct goodix_ts_data {
@@ -286,7 +287,7 @@ static void goodix_process_events(struct goodix_ts_data *ts)
 	int touch_num;
 	int i;
 
-	if (goodix_generate_wake_up_trigger) {
+	/*if (goodix_generate_wake_up_trigger) {
 		printk("###### Input trigger activated %d\n", __LINE__);
 		goodix_generate_wake_up_trigger = 0;
 
@@ -294,7 +295,7 @@ static void goodix_process_events(struct goodix_ts_data *ts)
 		input_sync(ts->input_dev);
 		input_report_key(ts->input_dev, KEY_POWER, 0);
 		input_sync(ts->input_dev);
-	}
+	}*/
 
 	touch_num = goodix_ts_read_input_report(ts, point_data);
 	if (touch_num < 0)
@@ -845,6 +846,10 @@ static int goodix_ts_probe(struct i2c_client *client,
 			return error;
 	}
 
+	dev = &ts->client->dev;
+	device_init_wakeup(dev, 1);
+	dev_pm_set_wake_irq(dev, ts->client->irq);
+
 	return 0;
 
 err_sysfs_remove_group:
@@ -986,7 +991,7 @@ static struct i2c_driver goodix_ts_driver = {
 		.name = "Goodix-TS",
 		.acpi_match_table = ACPI_PTR(goodix_acpi_match),
 		.of_match_table = of_match_ptr(goodix_of_match),
-		.pm = &goodix_pm_ops,
+		//.pm = &goodix_pm_ops,
 	},
 };
 module_i2c_driver(goodix_ts_driver);
