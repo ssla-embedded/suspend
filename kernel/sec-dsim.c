@@ -516,13 +516,15 @@ static const struct dsim_hblank_par *sec_mipi_dsim_get_hblank_par(const char *na
 
 static int _sec_mipi_dsim_pll_enable(struct sec_mipi_dsim *dsim, int enable)
 {
+	printk("######## %s %d\n", __func__, __LINE__);
+
 	if (dsim->clk_pllref_enable == enable)
 		return 0;
 
 	if (enable)
 		clk_prepare_enable(dsim->clk_pllref);
-	else
-		clk_disable_unprepare(dsim->clk_pllref);
+	//else
+		//clk_disable_unprepare(dsim->clk_pllref);
 	dsim->clk_pllref_enable = enable;
 	return 1;
 }
@@ -1154,6 +1156,7 @@ static void sec_mipi_dsim_set_main_mode(struct sec_mipi_dsim *dsim)
 static void sec_mipi_dsim_config_dpi(struct sec_mipi_dsim *dsim)
 {
 	uint32_t config = 0, rgb_status = 0, data_lanes_en;
+	printk("######## %s %d\n", __func__, __LINE__);
 
 	if (dsim->mode_flags & MIPI_DSI_MODE_VIDEO)
 		rgb_status &= ~RGB_STATUS_CMDMODE_INSEL;
@@ -1613,28 +1616,12 @@ panel_unprepare:
 
 static void sec_mipi_dsim_disable_clkctrl(struct sec_mipi_dsim *dsim)
 {
-	uint32_t clkctrl;
-
-	clkctrl = dsim_read(dsim, DSIM_CLKCTRL);
-
-	clkctrl &= ~CLKCTRL_TXREQUESTHSCLK;
-
-	clkctrl &= ~CLKCTRL_ESCCLKEN;
-
-	clkctrl &= ~CLKCTRL_BYTECLKEN;
-
-	dsim_write(dsim, clkctrl, DSIM_CLKCTRL);
+	printk("######## %s %d\n", __func__, __LINE__);
 }
 
 static void sec_mipi_dsim_disable_pll(struct sec_mipi_dsim *dsim)
 {
-	uint32_t pllctrl;
-
-	pllctrl  = dsim_read(dsim, DSIM_PLLCTRL);
-
-	pllctrl &= ~PLLCTRL_PLLEN;
-
-	dsim_write(dsim, pllctrl, DSIM_PLLCTRL);
+	printk("######## %s %d\n", __func__, __LINE__);
 }
 
 static void sec_mipi_dsim_bridge_power_up(struct drm_bridge *bridge)
@@ -1648,36 +1635,13 @@ static void sec_mipi_dsim_bridge_power_down(struct drm_bridge *bridge)
 {
 	struct sec_mipi_dsim *dsim = bridge->driver_private;
 
-	drm_panel_power_down(dsim->panel);
+	printk("######## %s %d\n", __func__, __LINE__);
+	//drm_panel_power_down(dsim->panel);
 }
 
 static void sec_mipi_dsim_bridge_disable(struct drm_bridge *bridge)
 {
-	int ret;
-	struct sec_mipi_dsim *dsim = bridge->driver_private;
-
-	/* disable panel if exists */
-	if (dsim->panel) {
-		ret = drm_panel_disable(dsim->panel);
-		if (unlikely(ret))
-			dev_err(dsim->dev, "panel disable failed: %d\n", ret);
-	}
-
-	/* disable data transfer of dsim */
-	sec_mipi_dsim_set_standby(dsim, false);
-
-	/* disable esc clock & byte clock */
-	sec_mipi_dsim_disable_clkctrl(dsim);
-
-	/* disable dsim pll */
-	sec_mipi_dsim_disable_pll(dsim);
-
-	/* unprepare panel if exists */
-	if (dsim->panel) {
-		ret = drm_panel_unprepare(dsim->panel);
-		if (unlikely(ret))
-			dev_err(dsim->dev, "panel unprepare failed: %d\n", ret);
-	}
+	printk("######## %s %d\n", __func__, __LINE__);
 }
 
 static bool sec_mipi_dsim_bridge_mode_fixup(struct drm_bridge *bridge,
@@ -1779,6 +1743,8 @@ static const struct drm_bridge_funcs sec_mipi_dsim_bridge_funcs = {
 
 int sec_mipi_dsim_pll_enable(struct drm_bridge *bridge, int enable)
 {
+	printk("######## %s %d   enable: %d\n", __func__, __LINE__, enable);
+
 	struct sec_mipi_dsim *dsim = bridge->driver_private;
 	int ret = _sec_mipi_dsim_check_pll_out(dsim);
 
@@ -1788,8 +1754,8 @@ int sec_mipi_dsim_pll_enable(struct drm_bridge *bridge, int enable)
 	dsim->enabled = enable;
 	if (enable)
 		clk_prepare_enable(dsim->clk_cfg);
-	else
-		clk_disable_unprepare(dsim->clk_cfg);
+	//else
+		//clk_disable_unprepare(dsim->clk_cfg);
 	_sec_mipi_dsim_pll_enable(dsim, enable);
 	return 0;
 }
@@ -1797,13 +1763,29 @@ EXPORT_SYMBOL(sec_mipi_dsim_pll_enable);
 
 void sec_mipi_dsim_suspend(struct device *dev)
 {
-	printk("###### %s %d\n", __func__, __LINE__);
+	struct sec_mipi_dsim *dsim = dev_get_drvdata(dev);
+
+	/* TODO: add dsim reset */
+
+	if (dsim->enabled) {
+		//clk_disable_unprepare(dsim->clk_cfg);
+		//_sec_mipi_dsim_pll_enable(dsim, 0);
+	}
 }
 EXPORT_SYMBOL(sec_mipi_dsim_suspend);
 
 void sec_mipi_dsim_resume(struct device *dev)
 {
-	printk("###### %s %d\n", __func__, __LINE__);
+	struct sec_mipi_dsim *dsim = dev_get_drvdata(dev);
+
+	if (dsim->enabled) {
+		_sec_mipi_dsim_pll_enable(dsim, 1);
+		clk_prepare_enable(dsim->clk_cfg);
+	}
+
+	sec_mipi_dsim_irq_init(dsim);
+
+	/* TODO: add dsim de-reset */
 }
 EXPORT_SYMBOL(sec_mipi_dsim_resume);
 
