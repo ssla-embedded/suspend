@@ -1650,8 +1650,14 @@ static void sec_mipi_dsim_bridge_power_down(struct drm_bridge *bridge)
 {
 	struct sec_mipi_dsim *dsim = bridge->driver_private;
 
-	printk("###### Input trigger configured %d\n", __LINE__);
-	goodix_generate_wake_up_trigger = 1;
+	if (goodix_generate_wake_up_trigger == -1) {
+		/* Ignore the first call */
+		printk("###### Input trigger ignored %d\n", __LINE__);
+		goodix_generate_wake_up_trigger = 0;
+	} else {
+		printk("###### Input trigger configured %d\n", __LINE__);
+		goodix_generate_wake_up_trigger = 1;
+	}
 
 	//drm_panel_power_down(dsim->panel);
 }
@@ -1660,9 +1666,6 @@ static void sec_mipi_dsim_bridge_disable(struct drm_bridge *bridge)
 {
 	int ret;
 	struct sec_mipi_dsim *dsim = bridge->driver_private;
-
-	printk("###### Input trigger configured %d\n", __LINE__);
-	goodix_generate_wake_up_trigger = 1;
 
 	/* disable panel if exists */
 	/*if (dsim->panel) {

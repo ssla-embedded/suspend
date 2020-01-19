@@ -270,7 +270,7 @@ static void goodix_ts_report_touch(struct goodix_ts_data *ts, u8 *coor_data)
 	input_report_abs(ts->input_dev, ABS_MT_WIDTH_MAJOR, input_w);
 }
 
-int goodix_generate_wake_up_trigger = 0;
+int goodix_generate_wake_up_trigger = -1;
 
 /**
  * goodix_process_events - Process incoming events
@@ -286,7 +286,7 @@ static void goodix_process_events(struct goodix_ts_data *ts)
 	int touch_num;
 	int i;
 
-	if (goodix_generate_wake_up_trigger) {
+	if (goodix_generate_wake_up_trigger > 0) {
 		printk("###### Input trigger activated %d\n", __LINE__);
 		goodix_generate_wake_up_trigger = 0;
 
