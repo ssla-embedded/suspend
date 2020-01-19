@@ -614,6 +614,20 @@ static int enter_state(suspend_state_t state)
  */
 int pm_suspend(suspend_state_t state)
 {
-	return 0;
+	int error;
+
+	if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX)
+		return -EINVAL;
+
+	pr_info("suspend entry (%s)\n", mem_sleep_labels[state]);
+	error = enter_state(state);
+	if (error) {
+		suspend_stats.fail++;
+		dpm_save_failed_errno(error);
+	} else {
+		suspend_stats.success++;
+	}
+	pr_info("suspend exit\n");
+	return error;
 }
 EXPORT_SYMBOL(pm_suspend);
