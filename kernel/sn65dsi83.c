@@ -409,20 +409,11 @@ static void sn_prepare(struct sn65dsi83_priv *sn)
 static void sn_powerdown1(struct sn65dsi83_priv *sn, int skip_irq)
 {
 	printk("####### %s %d\n", __func__, __LINE__);
-	dev_dbg(&sn->client->dev, "%s\n", __func__);
-	cancel_delayed_work(&sn->sn_work);
-	if (sn->state) {
-		mutex_lock(&sn->power_mutex);
-		sn_disable_pll(sn);
-		sn_disable(sn, skip_irq);
-		sn->state = SN_STATE_OFF;
-		mutex_unlock(&sn->power_mutex);
-	}
 }
 
 static void sn_powerdown(struct sn65dsi83_priv *sn)
 {
-	sn_powerdown1(sn, 0);
+	printk("####### %s %d\n", __func__, __LINE__);
 }
 
 static void sn_powerup_begin(struct sn65dsi83_priv *sn)
