@@ -1032,13 +1032,9 @@ static void drm_atomic_helper_bridge_power_up(struct drm_device *dev,
 	struct drm_connector *connector;
 	struct drm_connector_state *new_conn_state;
 	int i;
-	int j = -1;
 
 	for_each_new_connector_in_state(old_state, connector, new_conn_state, i) {
 		struct drm_encoder *encoder;
-
-		j++;
-		printk("#### power up %d:   connector %x\n", j, connector);
 
 		if (!new_conn_state->best_encoder)
 			continue;
@@ -1080,14 +1076,10 @@ static void drm_atomic_helper_bridge_power_down(struct drm_device *dev,
 	struct drm_connector *connector;
 	struct drm_connector_state *old_conn_state, *new_conn_state;
 	int i;
-	int j = -1;
 
 	for_each_oldnew_connector_in_state(old_state, connector, old_conn_state, new_conn_state, i) {
 		struct drm_encoder *encoder;
 		struct drm_crtc_state *old_crtc_state;
-
-		j++;
-		printk("#### power down %d:   connector %x\n", j, connector);
 
 		/* Shut down everything that's in the changeset and currently
 		 * still on. So need to check the old, saved state. */
@@ -1109,7 +1101,6 @@ static void drm_atomic_helper_bridge_power_down(struct drm_device *dev,
 			continue;
 
 		drm_atomic_bridge_power_down(encoder->bridge);
-		printk("#### powered down %d\n", j);
 	}
 }
 
