@@ -614,6 +614,8 @@ static int enter_state(suspend_state_t state)
  */
 int pm_suspend(suspend_state_t state)
 {
+	dump_stack();
+
 	return 0;
 }
 EXPORT_SYMBOL(pm_suspend);
