@@ -496,8 +496,7 @@ static ssize_t state_store(struct kobject *kobj, struct kobj_attribute *attr,
 
 	state = decode_state(buf, n);
 	if (state < PM_SUSPEND_MAX) {
-		if (state == PM_SUSPEND_MEM)
-			state = mem_sleep_current;
+		state = PM_SUSPEND_STANDBY;
 
 		error = pm_suspend(state);
 	} else if (state == PM_SUSPEND_MAX) {
