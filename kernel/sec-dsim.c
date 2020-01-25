@@ -1641,6 +1641,7 @@ static void sec_mipi_dsim_bridge_power_up(struct drm_bridge *bridge)
 {
 	struct sec_mipi_dsim *dsim = bridge->driver_private;
 
+	drm_panel_power_down(dsim->panel);
 	drm_panel_power_up(dsim->panel);
 }
 
